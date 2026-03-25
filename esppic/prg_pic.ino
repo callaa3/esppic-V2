@@ -12,9 +12,14 @@
 #define DLY1  10      // 10 microseconds for toggling and stuff
 #define DLY2  10000   // 10  millisecond for command delay
 
-#define PIN_RESET D0
-#define PIN_DAT   D1
-#define PIN_CLK   D2
+// ESP32 GPIO pin mapping
+#define PIN_RESET 27   // MCLR/VPP control (active HIGH = MCLR low via NPN transistor)
+#define PIN_DAT   25   // ICSPDAT (PGD)
+#define PIN_CLK   26   // ICSPCLK (PGC)
+#define PIN_VPP   14   // VPP enable (active HIGH = apply 8-9V, optional auto-VPP circuit)
+
+// Programming mode: 0=LVP (Low-Voltage), 1=HVP (High-Voltage, needed for Dyson BMS)
+uint8_t progMode = 1;  // Default HVP for PIC16LF1847 Dyson BMS
 
 #define DAT_INPUT   pinMode(PIN_DAT, INPUT);
 #define DAT_OUTPUT  pinMode(PIN_DAT, OUTPUT);
@@ -27,10 +32,16 @@
 #define CLK_LOW     digitalWrite(PIN_CLK,   LOW)
 #define CLK_HIGH    digitalWrite(PIN_CLK,   HIGH)
 
-#define RESET_INPUT  pinMode(PIN_RESET, INPUT);
+// RESET pin controls NPN transistor: HIGH = transistor ON = MCLR pulled to GND
+// This protects ESP32 from 8-9V VPP when using HVP mode
 #define RESET_OUTPUT pinMode(PIN_RESET, OUTPUT);
-void RESET_LOW(){   digitalWrite(PIN_RESET, LOW);}
-void RESET_HIGH(){  digitalWrite(PIN_RESET, HIGH);}
+void RESET_LOW(){   digitalWrite(PIN_RESET, LOW);}   // Transistor OFF, MCLR released
+void RESET_HIGH(){  digitalWrite(PIN_RESET, HIGH);}  // Transistor ON, MCLR = GND
+
+// VPP enable pin for automatic HVP circuit (optional)
+#define VPP_OUTPUT  pinMode(PIN_VPP, OUTPUT);
+void VPP_OFF(){    digitalWrite(PIN_VPP, LOW);}
+void VPP_ON(){     digitalWrite(PIN_VPP, HIGH);}
 
 
 uint16_t currentAddress;
@@ -41,14 +52,30 @@ uint16_t currentAddress;
 //
 void PicSetup() {
   RESET_OUTPUT;
+  VPP_OUTPUT;
   DAT_INPUT;
   CLK_INPUT;
-  // pinMode(PIN_RESET, OUTPUT);
-  // pinMode(PIN_DAT,   OUTPUT);
-  // pinMode(PIN_CLK,   OUTPUT);
-  RESET_HIGH();
-  // DAT_LOW;
-  // CLK_LOW;
+  RESET_LOW();   // Transistor OFF, MCLR released (PIC can run)
+  VPP_OFF();     // VPP disabled
+}
+
+
+//
+// Enter High-Voltage Programming mode (required when LVP is disabled)
+// Sequence: Hold MCLR at GND, then apply VPP (8-9V) to MCLR
+// The NPN transistor circuit allows safe VPP application
+//
+void EnterHVPmode() {
+  DAT_OUTPUT;
+  CLK_OUTPUT;
+  CLK_LOW;
+  DAT_LOW;
+  delayMicroseconds(500);
+  RESET_HIGH();    // Transistor ON: MCLR = GND
+  delayMicroseconds(500);
+  VPP_ON();        // Apply 8-9V VPP (via auto-VPP circuit on GPIO14)
+  RESET_LOW();     // Transistor OFF: release MCLR so VPP reaches pin
+  delayMicroseconds(500); // T_PENTH: >100us hold time
 }
 
 
@@ -62,7 +89,7 @@ void EnterLVPmode() {
   CLK_LOW;
   DAT_LOW;
   delayMicroseconds(500);
-  RESET_LOW();
+  RESET_HIGH();    // Transistor ON: MCLR = GND
   delayMicroseconds(500);
   Send(0b01010000,8); // P
   Send(0b01001000,8); // H
@@ -71,6 +98,20 @@ void EnterLVPmode() {
   Send(0,1);          // and one single final bit
   delayMicroseconds(DLY1);
  }
+
+
+//
+// Enter programming mode (selects HVP or LVP based on progMode setting)
+//
+void EnterProgMode() {
+  if (progMode == 1) {
+    Serial.println("Entering HVP mode...");
+    EnterHVPmode();
+  } else {
+    Serial.println("Entering LVP mode...");
+    EnterLVPmode();
+  }
+}
 
 
 //
@@ -261,32 +302,88 @@ void Store(uint32_t address, uint16_t data) {
 //
 //
 //
-void PicFlash(String filename) {
+void PicFlash(String uploadFilename) {
     int num=0;
     int cnt=0;
-    EnterLVPmode();
+    
+    // First pass: parse hex file to extract config words
+    uint16_t userIds[4] = {PICBLANKWORD, PICBLANKWORD, PICBLANKWORD, PICBLANKWORD};
+    uint16_t config1 = PICBLANKWORD;
+    uint16_t config2 = PICBLANKWORD;
+    bool hasConfig = false;
+    
+    Serial.print("Parsing hex file: ");
+    Serial.println(uploadFilename);
+    File fp = SPIFFS.open(uploadFilename, "r");
+    if (!fp) {
+      webSocket.sendTXT(num, "pFile error");
+      Serial.print("Couldn't open ");
+      Serial.println(uploadFilename);
+      return;
+    }
+    
+    uint16_t parseOffset = 0;
+    while(fp.available()) {
+      String s = fp.readStringUntil('\n');
+      uint8_t d_len = HexDec2(s[1],s[2]);
+      uint16_t d_addr = HexDec4(s[3],s[4],s[5],s[6]);
+      uint8_t d_typ = HexDec2(s[7],s[8]);
+      
+      if (d_typ==0x04) {
+        parseOffset = HexDec4(s[11],s[12],s[9],s[10]);
+      }
+      if (d_typ==0x00 && parseOffset != 0) {
+        // Config/User ID space data
+        for (uint8_t i=0; i<d_len*2; i+=4) {
+          uint32_t wordAddr = ((uint32_t)parseOffset << 16 | d_addr) / 2 + i/4;
+          uint16_t data = HexDec4(s[11+i],s[12+i],s[9+i],s[10+i]);
+          // Map to config space addresses (0x8000+)
+          if (wordAddr >= 0x8000 && wordAddr <= 0x8003) {
+            userIds[wordAddr - 0x8000] = data;
+            hasConfig = true;
+          }
+          if (wordAddr == 0x8007) { config1 = data; hasConfig = true; }
+          if (wordAddr == 0x8008) { config2 = data; hasConfig = true; }
+        }
+      }
+    }
+    fp.close();
+    
+    if (hasConfig) {
+      Serial.printf("Config from hex: CONFIG1=0x%04X CONFIG2=0x%04X\n", config1, config2);
+      Serial.printf("User IDs: %04X %04X %04X %04X\n", userIds[0], userIds[1], userIds[2], userIds[3]);
+    } else {
+      Serial.println("No config words found in hex file, using defaults");
+    }
+    
+    // Enter programming mode
+    EnterProgMode();
     CmdResetAddress();
     CmdLoadConfig(0x00);
     CmdBulkErase();
-    Store(USERID+0,SWAP16(0x8031)); delay(5);
-    Store(USERID+1,SWAP16(0x0228)); delay(5);
-    Store(USERID+2,SWAP16(0x8731)); delay(5);
-    Store(USERID+3,SWAP16(0xE12F)); delay(5);
-    Store(CONFIG1, SWAP16(0xE4C9)); delay(5);
-    Store(CONFIG2, SWAP16(0xFBFF)); delay(5);
+    
+    // Write User IDs and Config words (from hex file or defaults)
+    if (hasConfig) {
+      Store(USERID+0, userIds[0]); delay(5);
+      Store(USERID+1, userIds[1]); delay(5);
+      Store(USERID+2, userIds[2]); delay(5);
+      Store(USERID+3, userIds[3]); delay(5);
+      Store(CONFIG1, config1); delay(5);
+      Store(CONFIG2, config2); delay(5);
+    }
 
-    // CODE
-    Serial.print("Trying to open ");
-    Serial.println(filename);
-    File f = SPIFFS.open(filename, "r");
+    // Second pass: flash program memory from hex file
+    Serial.print("Flashing code from ");
+    Serial.println(uploadFilename);
+    File f = SPIFFS.open(uploadFilename, "r");
     if (!f) {
       webSocket.sendTXT(num, "pFile error");
       Serial.print("Couldn't open ");
-      Serial.println(filename);
+      Serial.println(uploadFilename);
       return;
     }
     webSocket.sendTXT(num, "pFlashing...");
-    uint16_t offset;
+    uint16_t offset = 0;
     while(f.available()) {
       uint8_t d_len;
       uint16_t d_addr;
@@ -296,7 +393,7 @@ void PicFlash(String filename) {
       d_len=HexDec2(s[1],s[2]);
       d_addr=HexDec4(s[3],s[4],s[5],s[6]);
       d_typ=HexDec2(s[7],s[8]);
-      Serial.printf("len=%02x addres=%04x type=%02x\n",d_len,d_addr,d_typ);
+      Serial.printf("len=%02x address=%04x type=%02x\n",d_len,d_addr,d_typ);
       if (d_typ==0x00) {
         for (uint8_t i=0; i<d_len*2; i+=4) {
           uint32_t address=d_addr/2+i/4;
@@ -304,9 +401,8 @@ void PicFlash(String filename) {
           if (offset==0) {
             cnt++;
             Store(address,data);
-          } else {
-
           }
+          // Config space data already handled in first pass
         }
       }
       if (d_typ==0x04) {
@@ -315,13 +411,24 @@ void PicFlash(String filename) {
       }
     }
     f.close();
-    char tmps[20];
-    sprintf(tmps,"pTotal %d bytes flashed",cnt);
+    char tmps[40];
+    sprintf(tmps,"pFlashed %d words successfully",cnt);
     webSocket.sendTXT(num, tmps);
+    Serial.println(tmps);
 
-    RESET_HIGH();
+    ExitProgMode();
+}
+
+
+//
+// Cleanly exit programming mode
+//
+void ExitProgMode() {
+    VPP_OFF();       // Remove VPP
+    RESET_LOW();     // Transistor OFF, release MCLR
     DAT_INPUT;
     CLK_INPUT;
+    delay(10);       // Let PIC reset and start running
 }
 
 
@@ -329,14 +436,12 @@ void PicFlash(String filename) {
 //
 //
 void PicReadConfigs(void (*f)(const String)) {
-    EnterLVPmode();
+    EnterProgMode();
     CmdResetAddress();
     DumpConfig(f);
     f("<br />");
     DumpMemory(f);
-    RESET_HIGH();
-    DAT_INPUT;
-    CLK_INPUT;
+    ExitProgMode();
 }
 
 
@@ -344,12 +449,12 @@ void PicReadConfigs(void (*f)(const String)) {
 //
 //
 void PicReset(char type) {
-  if (type=='H') RESET_HIGH();
-  if (type=='L') RESET_LOW();
+  if (type=='H') RESET_LOW();   // Release MCLR (PIC runs)
+  if (type=='L') RESET_HIGH();  // Pull MCLR low (PIC halted)
   if (type=='P') {
-      RESET_LOW();
+      RESET_HIGH();  // Pull MCLR low
       delay(250);
-      RESET_HIGH();
+      RESET_LOW();   // Release MCLR (PIC starts)
   }
 }
 

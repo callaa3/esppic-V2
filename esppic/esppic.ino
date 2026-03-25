@@ -1,16 +1,24 @@
 //
-// esppic - An ESP8266-based Microchip PIC programmer
-//----------------------------------------------------
-// More info at github.com/SmallRoomLabs/esppic
+// esppic-V2 - An ESP32-based Microchip PIC programmer
+//-----------------------------------------------------
+// Forked from github.com/SmallRoomLabs/esppic
+// Updated for ESP32 (ESP-WROOM-32) and PIC16LF1847 (Dyson BMS)
 //
-// Copyright (c) 2016 Mats Engstrom SmallRoomLabs
+// Original Copyright (c) 2016 Mats Engstrom SmallRoomLabs
 // Released under the MIT license
 //
-#include <ESP8266WiFi.h>
-#include <ESP8266WebServer.h>
-#include <WebSocketsServer.h>
-#include <FS.h>
+// Fixes applied:
+//   - Issue #2: Renamed conflicting 'filename' variable (PR #4)
+//   - Issue #3: Fixed handleFileRead blocking page access (PR #5)
+//   - Ported from ESP8266 to ESP32
+//   - Added HVP (High-Voltage Programming) support for PIC16LF1847
+//   - Config words read from hex file instead of hardcoded
+//
 
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WebSocketsServer.h>
+#include <SPIFFS.h>
 
 #define SWAP16(x) (((x & 0x00ff) << 8) | ((x & 0xff00) >> 8))
 
@@ -19,9 +27,9 @@
 #include "favicon_ico.h"
 #include "logo_png.h"
 
-ESP8266WebServer server(80);
+WebServer server(80);
 WebSocketsServer webSocket = WebSocketsServer(81);
-String filename;
+String uploadFilename;
 File fsUploadFile;
 char resetflag=0;
 uint8_t wsNum;
@@ -29,7 +37,7 @@ uint8_t wsNum;
 //
 //
 //
-void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t lenght) {
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
   IPAddress ip;
   switch(type) {
     case WStype_DISCONNECTED:
@@ -49,12 +57,13 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t lenght
       if (payload[0]=='R') resetflag=payload[1];
       if (payload[0]=='F' && payload[1]=='L') {
         Serial.println("[flash]");
-        PicFlash(filename);
+        PicFlash(uploadFilename);
       }
       break;
     case WStype_BIN:
-      Serial.printf("[%u] get binary lenght: %u\n", num, lenght);
-      hexdump(payload, lenght);
+      Serial.printf("[%u] get binary length: %u\n", num, length);
+      for (size_t i = 0; i < length; i++) Serial.printf("%02X ", payload[i]);
+      Serial.println();
       break;
   }
 }
@@ -66,22 +75,22 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t lenght
 //
 void handleFileUpload() {
   char tmps[30];
-  static uint32 bytesSoFar=0;
+  static uint32_t bytesSoFar=0;
   if(server.uri() != "/upload") return;
   Serial.println("handleFileUpload()"); 
   HTTPUpload& upload = server.upload();
   if(upload.status == UPLOAD_FILE_START){
     bytesSoFar=0;
-    filename = upload.filename;
-    sprintf(tmps,"f%s",filename.c_str());
+    uploadFilename = upload.filename;
+    sprintf(tmps,"f%s",uploadFilename.c_str());
     webSocket.sendTXT(wsNum, tmps);
     sprintf(tmps,"s%d/%d bytes uploaded",bytesSoFar,upload.totalSize);
     webSocket.sendTXT(wsNum, tmps);
     webSocket.sendTXT(wsNum, "pUploading file");
-    if (filename.endsWith(".hex")) filename = "/hex/"+filename;
-    else filename="/"+filename;
-    Serial.printf("Receiving file %s\n",filename.c_str()); 
-    fsUploadFile = SPIFFS.open(filename, "w");
+    if (uploadFilename.endsWith(".hex")) uploadFilename = "/hex/"+uploadFilename;
+    else uploadFilename="/"+uploadFilename;
+    Serial.printf("Receiving file %s\n",uploadFilename.c_str()); 
+    fsUploadFile = SPIFFS.open(uploadFilename, "w");
   }
   else if(upload.status == UPLOAD_FILE_WRITE){
     if(fsUploadFile) {
@@ -97,7 +106,7 @@ void handleFileUpload() {
     Serial.println("Success");
     webSocket.sendTXT(wsNum, "pFile uploaded" );
     delay(250);
-    PicFlash(filename);
+    PicFlash(uploadFilename);
   }
 }
 
@@ -122,23 +131,14 @@ bool handleFileRead(String path){
   Serial.printf("handleFileRead(%s)\n",path.c_str());
   if(path.endsWith("/")) path += "index.html";
   String contentType = getContentType(path);
-  // String pathWithGz = path + ".gz";
-  // if(SPIFFS.exists(pathWithGz) || SPIFFS.exists(path)){
-  //   if(SPIFFS.exists(pathWithGz)) path += ".gz";
-  //   Serial.printf("handleFileRead(%s)\n",path.c_str());
-  uint32_t t1=millis();
+  if(SPIFFS.exists(path)){
     File file = SPIFFS.open(path, "r");
-    uint32_t si=file.size();
-  uint32_t t2=millis();
     size_t sent = server.streamFile(file, contentType);
-  uint32_t t3=millis();
     file.close();
-  uint32_t t4=millis();
-    Serial.printf("%s (%ld bytes) Open:%ld Stream:%ld Close:%ld\n",
-                  path.c_str(),si,t2-t1, t3-t2, t3-t4);
+    Serial.printf("%s (%d bytes) served\n", path.c_str(), sent);
     return true;
-  // }
-  // return false;
+  }
+  return false;
 }
 
 
@@ -155,11 +155,12 @@ void setup() {
   PicSetup();
 
   Serial.begin(115200);
-  Serial.println("\n\n\nESPPIC v0.2 starting\n");
-  SPIFFS.begin();
-  FSInfo fs_info;
-  SPIFFS.info(fs_info);
-  Serial.printf("%d of %d KB used on SPIFFS\n",fs_info.usedBytes/(1024),fs_info.totalBytes/(1024));
+  Serial.println("\n\n\nESPPIC v2.0 starting (ESP32 + PIC16LF1847)\n");
+  if(!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS mount failed");
+    return;
+  }
+  Serial.printf("%d of %d bytes used on SPIFFS\n", SPIFFS.usedBytes(), SPIFFS.totalBytes());
   ConnectToWifi();
 
   server.begin();
@@ -199,15 +200,18 @@ void setup() {
       }
     }
 
-    Dir dir = SPIFFS.openDir("/");
-    while (dir.next()) {
-      String str="<a href='/fm?d="+dir.fileName()+"'>delete</a> ";
-      str += "<a href='/fm?p="+dir.fileName()+"'>show</a> ";
-      str += dir.fileName();
+    File root = SPIFFS.open("/");
+    File dir = root.openNextFile();
+    while (dir) {
+      String fname = String(dir.name());
+      String str="<a href='/fm?d="+fname+"'>delete</a> ";
+      str += "<a href='/fm?p="+fname+"'>show</a> ";
+      str += fname;
       str += " (";
-      str += dir.fileSize();
+      str += dir.size();
       str += " bytes)<br>";
       server.sendContent(str);
+      dir = root.openNextFile();
     }
 
     server.sendContent(String("</samp>"));
@@ -243,7 +247,7 @@ void setup() {
 
   server.on("/flash", HTTP_GET, []() {
     Serial.println("HTTP_GET /flash");
-    PicFlash(filename);
+    PicFlash(uploadFilename);
     char *html=(char *)malloc(10000);
     strcpy(html,"<h1>FLASH DONE</h1><a href=\"/\">Back</a>");
     server.send(200, "text/html", html);
