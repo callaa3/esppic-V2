@@ -77,7 +77,7 @@ The NPN transistor protects the ESP32 from the 8-9V VPP. When GPIO 27 goes HIGH,
 
 ### Simplified Wiring (Manual VPP)
 
-If you don't have the parts for the auto-VPP circuit, you can manually connect VPP when the script tells you to:
+If you don't have the parts for the full auto-VPP circuit, you **still need one NPN transistor on GPIO 27** — this is required for the HVP entry sequence (the ESP32 must pull MCLR to GND before VPP is applied). You can manually connect 8-9V when the script tells you to:
 
 ```
     ESP32 DevKit                    Dyson BMS (ICSP Pads)
@@ -91,8 +91,9 @@ If you don't have the parts for the auto-VPP circuit, you can manually connect V
 ```
 
 > **WARNING**: Do NOT connect the 8-9V supply directly to an ESP32 GPIO pin.
-> Always use the NPN transistor circuit. The transistor protects the ESP32
-> from the high voltage on the MCLR/VPP line.
+> The NPN transistor on GPIO 27 is **required** — it pulls MCLR to GND during
+> HVP entry. Without it, the PIC will not enter programming mode and all
+> reads will return 0x3FFF (blank).
 
 ### Pin Summary
 
@@ -180,6 +181,7 @@ esppic-V2/
 | "File error" during flash | Make sure `.hex` file uploaded successfully first |
 | PIC not responding | Check wiring, ensure battery is awake (press button/magnet) |
 | Flash succeeds but PIC doesn't run | Verify VPP was removed after programming |
+| Config reads all 0x3FFF (blank) | NPN transistor on GPIO 27 is missing — required for HVP entry |
 | Compile error on `filename` | Already fixed in this fork (Issue #2) |
 
 ## Credits

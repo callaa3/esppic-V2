@@ -193,12 +193,54 @@ echo "  IMPORTANT: Wake the battery first!"
 echo "    - V6: Press the trigger button"
 echo "    - V7: Press button AND hold magnet on reed switch"
 echo ""
-read -rp "  Wiring verified and battery is awake? [y/N]: " wired
+read -rp "  Wiring verified and battery is awake? [y/N/d=diag]: " wired
+if [[ "$wired" =~ ^[Dd]$ ]]; then
+    echo ""
+    info "Running wiring diagnostics on ESP32..."
+    echo "  (Make sure 8-9V is connected if using auto-VPP, or connected to MCLR for manual)"
+    echo ""
+    DIAG_RESPONSE=$(curl -s --connect-timeout 10 --max-time 15 "http://$ESP_IP/diag" 2>/dev/null || echo "Failed to reach ESP32")
+    echo "$DIAG_RESPONSE"
+    echo ""
+    read -rp "  Continue to flash? [y/N]: " wired
+fi
 if [[ ! "$wired" =~ ^[Yy]$ ]]; then
     echo "  Aborted. Wire up your connections and try again."
     exit 0
 fi
 echo ""
+
+# ------------------------------------------------------------------
+# VPP mode selection
+# ------------------------------------------------------------------
+echo -e "${YELLOW}${BOLD}  VPP MODE${NC}"
+echo ""
+echo "  How is your 8-9V VPP supply connected?"
+echo ""
+echo "    [1] AUTO-VPP — GPIO 14 transistor circuit switches 8-9V automatically"
+echo "    [2] MANUAL VPP — I will connect 8-9V to MCLR by hand when prompted"
+echo ""
+read -rp "  Select [1/2]: " vpp_choice
+
+case "$vpp_choice" in
+    1) VPP_MODE="auto" ;;
+    2) VPP_MODE="manual" ;;
+    *) VPP_MODE="manual"; warn "Defaulting to manual VPP mode." ;;
+esac
+
+ok "VPP mode: $VPP_MODE"
+echo ""
+
+# For manual VPP, set the flag on ESP32 BEFORE upload to prevent auto-flash
+if [[ "$VPP_MODE" == "manual" ]]; then
+    info "Setting manual VPP mode on ESP32..."
+    PREP_EARLY=$(curl -s --connect-timeout 10 "http://$ESP_IP/prep_hvp" 2>/dev/null || echo "FAIL")
+    if [[ "$PREP_EARLY" != "OK" ]]; then
+        fail "Failed to set manual VPP mode. Is the ESP32 firmware up to date? Re-run ./flashesp.sh first."
+    fi
+    ok "Manual VPP mode set — auto-flash after upload disabled."
+    echo ""
+fi
 
 # ------------------------------------------------------------------
 # Upload hex file to ESP32
@@ -224,39 +266,117 @@ echo ""
 # ------------------------------------------------------------------
 # VPP timing prompt (for HVP mode)
 # ------------------------------------------------------------------
-echo -e "${YELLOW}${BOLD}  VPP CONNECTION TIMING${NC}"
-echo ""
-echo "  The ESP32 will now attempt to program the PIC16LF1847."
-echo "  Since HVP (High-Voltage Programming) mode is used:"
-echo ""
-echo "  If you have the AUTO-VPP circuit (GPIO 14 controls 8-9V):"
-echo "    → VPP will be applied automatically. Just press Enter."
-echo ""
-echo "  If you are using MANUAL VPP:"
-echo "    1. Have your 8-9V supply ready but NOT connected to MCLR"
-echo "    2. Press Enter below — the ESP32 will pull MCLR low"
-echo "    3. QUICKLY connect 8-9V to MCLR/VPP when prompted"
-echo ""
-read -rp "  Ready to flash? Press Enter to begin... "
-echo ""
+if [[ "$VPP_MODE" == "manual" ]]; then
+    echo -e "${YELLOW}${BOLD}  MANUAL VPP — CONNECT 8-9V${NC}"
+    echo ""
+    echo "  The ESP32 has PGD/PGC held low (ready for HVP entry)."
+    echo ""
+    echo -e "  ${RED}${BOLD}>>> NOW CONNECT 8-9V TO MCLR/VPP <<<${NC}"
+    echo ""
+    echo "  Connect your 8-9V supply to the MCLR/VPP pin now."
+    echo "  The PIC will enter HVP programming mode when voltage is applied."
+    echo ""
+    read -rp "  8-9V connected? Press Enter to start flashing... "
+    echo ""
+
+else
+    echo -e "${YELLOW}${BOLD}  VPP CONNECTION TIMING${NC}"
+    echo ""
+    echo "  The ESP32 will handle VPP automatically via the GPIO 14 circuit."
+    echo ""
+    read -rp "  Ready to flash? Press Enter to begin... "
+    echo ""
+fi
 
 # ------------------------------------------------------------------
 # Trigger flash
 # ------------------------------------------------------------------
 info "Triggering PIC flash via ESP32..."
+echo -ne "  Flashing: "
 
-# The upload handler auto-triggers flash after upload.
-# If the hex was uploaded and auto-flashed, we can also trigger via /flash endpoint.
-FLASH_RESPONSE=$(curl -s --connect-timeout 30 --max-time 120 "http://$ESP_IP/flash" 2>/dev/null || echo "")
+# Run curl in background so we can show a spinner
+FLASH_TMPFILE=$(mktemp)
+curl -s --connect-timeout 30 --max-time 120 "http://$ESP_IP/flash" > "$FLASH_TMPFILE" 2>/dev/null &
+CURL_PID=$!
+
+# Spinner with elapsed time
+SPIN_CHARS='|/-\'
+SECONDS=0
+i=0
+while kill -0 "$CURL_PID" 2>/dev/null; do
+    printf "\r  Flashing: ${SPIN_CHARS:i%4:1} %ds elapsed " "$SECONDS"
+    i=$((i+1))
+    sleep 0.25
+done
+wait "$CURL_PID"
+printf "\r  Flashing: done (%ds)          \n" "$SECONDS"
+
+FLASH_RESPONSE=$(cat "$FLASH_TMPFILE")
+rm -f "$FLASH_TMPFILE"
 
 if echo "$FLASH_RESPONSE" | grep -qi "FLASH DONE"; then
     ok "PIC16LF1847 flashed successfully!"
+    FLASH_OK=true
+elif echo "$FLASH_RESPONSE" | grep -qi "FLASH FAILED\|not responding\|Check wiring"; then
+    echo ""
+    fail "PIC did not respond — it never entered programming mode!
+
+  The ESP32 could not communicate with the PIC. This means:
+    - The NPN transistor on GPIO 27 may not be wired correctly
+      (2N3904 pinout flat side facing you: Emitter-Base-Collector, left to right)
+    - The 8-9V supply may not be reaching MCLR/VPP pin
+    - The ICSP data/clock wires may be on wrong pins
+    - The battery may not be awake (press trigger first for V6)
+
+  Check your connections and try again."
 else
     warn "Flash response may not have completed cleanly."
     echo "  Response: $FLASH_RESPONSE"
     echo ""
     echo "  Check the ESP32 serial monitor for detailed output."
     echo "  You can also check the web UI at http://$ESP_IP/i.html"
+    FLASH_OK=false
+fi
+
+# ------------------------------------------------------------------
+# Read back config (optional, BEFORE disconnecting VPP)
+# ------------------------------------------------------------------
+if [[ "$FLASH_OK" == "true" && "$VPP_MODE" == "manual" ]]; then
+    echo ""
+    echo -e "  ${YELLOW}Keep 8-9V connected for now — you can verify the flash first.${NC}"
+    echo ""
+    read -rp "  Read back PIC config to verify? [y/N]: " readback
+    if [[ "$readback" =~ ^[Yy]$ ]]; then
+        info "Prepping manual HVP for config read..."
+        curl -s --connect-timeout 10 "http://$ESP_IP/prep_hvp" >/dev/null 2>&1
+        sleep 0.5
+        info "Reading PIC config..."
+        CONFIG_RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 "http://$ESP_IP/readconfigs" 2>/dev/null || echo "Failed to read config")
+        echo ""
+        echo "  Config dump:"
+        CONFIG_TEXT=$(echo "$CONFIG_RESPONSE" | sed 's/<br[^>]*>/\n/g; s/<[^>]*>//g' | head -20)
+        echo "$CONFIG_TEXT"
+        echo ""
+        if echo "$CONFIG_TEXT" | grep -q "3fff.*3fff.*3fff.*3fff"; then
+            warn "All values are 0x3FFF — PIC may not have been programmed."
+            echo "  This usually means HVP entry failed. Check transistor wiring."
+        fi
+    fi
+    echo ""
+    echo -e "  ${RED}${BOLD}Now REMOVE the 8-9V VPP supply from MCLR.${NC}"
+    read -rp "  VPP removed? Press Enter to continue... "
+elif [[ "$FLASH_OK" == "true" ]]; then
+    echo ""
+    read -rp "  Read back PIC config to verify? [y/N]: " readback
+    if [[ "$readback" =~ ^[Yy]$ ]]; then
+        echo ""
+        info "Reading PIC config..."
+        CONFIG_RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 "http://$ESP_IP/readconfigs" 2>/dev/null || echo "Failed to read config")
+        echo ""
+        echo "  Config dump:"
+        echo "$CONFIG_RESPONSE" | sed 's/<br[^>]*>/\n/g; s/<[^>]*>//g' | head -20
+        echo ""
+    fi
 fi
 
 # ------------------------------------------------------------------
@@ -265,29 +385,14 @@ fi
 echo ""
 echo -e "${YELLOW}${BOLD}  POST-FLASH STEPS${NC}"
 echo ""
-echo "  1. REMOVE the 8-9V VPP supply from MCLR"
-echo "  2. Disconnect all ICSP wires from the Dyson BMS"
-echo "  3. Reassemble the battery pack"
+echo "  1. Disconnect all ICSP wires from the Dyson BMS"
+echo "  2. Reassemble the battery pack"
 echo ""
 echo "  To verify the new firmware:"
 echo "    - Press the trigger: should see Red-Green-Blue flash sequence"
 echo "    - Connect charger: yellow flashes = cell balance indicator"
 echo "    - Hold trigger + connect charger: white flashes = firmware version"
 echo ""
-
-# ------------------------------------------------------------------
-# Read back config (optional)
-# ------------------------------------------------------------------
-read -rp "  Read back PIC config to verify? [y/N]: " readback
-if [[ "$readback" =~ ^[Yy]$ ]]; then
-    echo ""
-    info "Reading PIC config..."
-    CONFIG_RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 "http://$ESP_IP/readconfigs" 2>/dev/null || echo "Failed to read config")
-    echo ""
-    echo "  Config dump:"
-    echo "$CONFIG_RESPONSE" | sed 's/<br[^>]*>/\n/g; s/<[^>]*>//g' | head -20
-    echo ""
-fi
 
 # ------------------------------------------------------------------
 # Done

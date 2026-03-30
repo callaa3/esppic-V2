@@ -1,25 +1,11 @@
-#define FLASHSIZE       8192
-#define PICMAXWORDS     8192
-#define PICBLANKWORD    0x3FFF
-
-// Locations of the special Config & Id memories on the PIC
-#define USERID    0 
-#define CONFIG1   7
-#define CONFIG2   8
-#define DEVID     6
-#define DEVREV    5
-
-#define DLY1  10      // 10 microseconds for toggling and stuff
-#define DLY2  10000   // 10  millisecond for command delay
-
-// ESP32 GPIO pin mapping
-#define PIN_RESET 27   // MCLR/VPP control (active HIGH = MCLR low via NPN transistor)
-#define PIN_DAT   25   // ICSPDAT (PGD)
-#define PIN_CLK   26   // ICSPCLK (PGC)
-#define PIN_VPP   14   // VPP enable (active HIGH = apply 8-9V, optional auto-VPP circuit)
+#include "pic_defs.h"
 
 // Programming mode: 0=LVP (Low-Voltage), 1=HVP (High-Voltage, needed for Dyson BMS)
 uint8_t progMode = 1;  // Default HVP for PIC16LF1847 Dyson BMS
+
+// Manual VPP flag: when true, EnterHVPmode skips transistor control
+// (user has already applied 8-9V to MCLR externally)
+bool manualVPP = false;
 
 #define DAT_INPUT   pinMode(PIN_DAT, INPUT);
 #define DAT_OUTPUT  pinMode(PIN_DAT, OUTPUT);
@@ -38,10 +24,13 @@ uint8_t progMode = 1;  // Default HVP for PIC16LF1847 Dyson BMS
 void RESET_LOW(){   digitalWrite(PIN_RESET, LOW);}   // Transistor OFF, MCLR released
 void RESET_HIGH(){  digitalWrite(PIN_RESET, HIGH);}  // Transistor ON, MCLR = GND
 
-// VPP enable pin for automatic HVP circuit (optional)
+// VPP control via NPN shunt transistor on GPIO 14:
+//   NPN collector → MCLR, emitter → GND, base ← GPIO 14 via 1K
+//   VPP_ON:  GPIO LOW  → NPN OFF → 8-9V reaches MCLR
+//   VPP_OFF: GPIO HIGH → NPN ON  → MCLR clamped to GND (VPP blocked)
 #define VPP_OUTPUT  pinMode(PIN_VPP, OUTPUT);
-void VPP_OFF(){    digitalWrite(PIN_VPP, LOW);}
-void VPP_ON(){     digitalWrite(PIN_VPP, HIGH);}
+void VPP_OFF(){    digitalWrite(PIN_VPP, HIGH);}   // NPN ON: clamp MCLR to GND
+void VPP_ON(){     digitalWrite(PIN_VPP, LOW);}    // NPN OFF: 8-9V reaches MCLR
 
 
 uint16_t currentAddress;
@@ -61,6 +50,24 @@ void PicSetup() {
 
 
 //
+// Prepare for manual HVP: pull MCLR low via NPN1, set PGD/PGC low.
+// Called via /prep_hvp endpoint. User then connects 8-9V to MCLR
+// (NPN1 holds it at GND). When /flash is called, EnterHVPmode releases
+// NPN1 so MCLR rises to VPP and the PIC enters programming mode.
+//
+void PrepManualHVP() {
+  DAT_OUTPUT;
+  CLK_OUTPUT;
+  CLK_LOW;
+  DAT_LOW;
+  delayMicroseconds(500);
+  RESET_HIGH();    // NPN1 ON: pull MCLR to GND
+  manualVPP = true;
+  Serial.println("Manual HVP prep: MCLR held LOW, PGD/PGC low. Connect 8-9V to MCLR now.");
+}
+
+
+//
 // Enter High-Voltage Programming mode (required when LVP is disabled)
 // Sequence: Hold MCLR at GND, then apply VPP (8-9V) to MCLR
 // The NPN transistor circuit allows safe VPP application
@@ -71,6 +78,16 @@ void EnterHVPmode() {
   CLK_LOW;
   DAT_LOW;
   delayMicroseconds(500);
+
+  if (manualVPP) {
+    // NPN1 is holding MCLR at GND, user has connected 8-9V.
+    // Release NPN1 so MCLR rises to VPP → PIC enters HVP mode.
+    Serial.println("HVP: Manual VPP — releasing MCLR (NPN1 OFF)");
+    RESET_LOW();     // NPN1 OFF: release MCLR, VPP reaches pin
+    delayMicroseconds(500); // T_PENTH: >100us hold time
+    return;
+  }
+
   RESET_HIGH();    // Transistor ON: MCLR = GND
   delayMicroseconds(500);
   VPP_ON();        // Apply 8-9V VPP (via auto-VPP circuit on GPIO14)
@@ -302,7 +319,7 @@ void Store(uint32_t address, uint16_t data) {
 //
 //
 //
-void PicFlash(String uploadFilename) {
+bool PicFlash(String uploadFilename) {
     int num=0;
     int cnt=0;
     
@@ -319,7 +336,7 @@ void PicFlash(String uploadFilename) {
       webSocket.sendTXT(num, "pFile error");
       Serial.print("Couldn't open ");
       Serial.println(uploadFilename);
-      return;
+      return false;
     }
     
     uint16_t parseOffset = 0;
@@ -356,8 +373,52 @@ void PicFlash(String uploadFilename) {
       Serial.println("No config words found in hex file, using defaults");
     }
     
-    // Enter programming mode
-    EnterProgMode();
+    // Enter programming mode with retry loop
+    uint16_t devId = 0x3FFF;
+    bool isManual = manualVPP;  // Save flag — ExitProgMode clears it
+    for (int attempt = 1; attempt <= 10; attempt++) {
+      Serial.printf("HVP entry attempt %d/10...\n", attempt);
+      char attemptMsg[50];
+      sprintf(attemptMsg, "pHVP entry attempt %d/10...", attempt);
+      webSocket.sendTXT(num, attemptMsg);
+
+      manualVPP = isManual;  // Restore flag for this attempt
+      EnterProgMode();
+      CmdResetAddress();
+      CmdLoadConfig(0x00);
+      uint16_t devCheck[16];
+      CmdReadData(devCheck, 16);
+      devId = devCheck[DEVID];
+      Serial.printf("  DEVID: 0x%04X\n", devId);
+
+      if (devId != 0x3FFF && devId != 0x0000) {
+        break;  // PIC responded
+      }
+
+      // Failed — exit prog mode, wait, then retry
+      ExitProgMode();
+      Serial.println("  PIC not responding, retrying...");
+      delay(500);
+
+      // Re-prep for manual VPP (NPN1 pulls MCLR low again before next attempt)
+      if (isManual) {
+        PrepManualHVP();
+        delay(200);
+      }
+    }
+
+    if (devId == 0x3FFF || devId == 0x0000) {
+      Serial.println("ERROR: PIC not responding after 10 attempts. HVP entry failed!");
+      webSocket.sendTXT(num, "pERROR: PIC not responding after 10 attempts! Check wiring/VPP.");
+      ExitProgMode();
+      return false;
+    }
+
+    Serial.printf("PIC detected! DEVID=0x%04X\n", devId);
+    char devMsg[60];
+    sprintf(devMsg, "pPIC detected (DEVID=0x%04X). Erasing...", devId);
+    webSocket.sendTXT(num, devMsg);
+
     CmdResetAddress();
     CmdLoadConfig(0x00);
     CmdBulkErase();
@@ -380,20 +441,19 @@ void PicFlash(String uploadFilename) {
       webSocket.sendTXT(num, "pFile error");
       Serial.print("Couldn't open ");
       Serial.println(uploadFilename);
-      return;
+      return false;
     }
     webSocket.sendTXT(num, "pFlashing...");
     uint16_t offset = 0;
+    uint16_t lastProgress = 0;
     while(f.available()) {
       uint8_t d_len;
       uint16_t d_addr;
       uint8_t d_typ;
       String s = f.readStringUntil('\n');
-      Serial.println(s);
       d_len=HexDec2(s[1],s[2]);
       d_addr=HexDec4(s[3],s[4],s[5],s[6]);
       d_typ=HexDec2(s[7],s[8]);
-      Serial.printf("len=%02x address=%04x type=%02x\n",d_len,d_addr,d_typ);
       if (d_typ==0x00) {
         for (uint8_t i=0; i<d_len*2; i+=4) {
           uint32_t address=d_addr/2+i/4;
@@ -401,8 +461,15 @@ void PicFlash(String uploadFilename) {
           if (offset==0) {
             cnt++;
             Store(address,data);
+            // Progress every 100 words
+            if (cnt - lastProgress >= 100) {
+              lastProgress = cnt;
+              Serial.printf("Flashed %d words...\n", cnt);
+              char pmsg[40];
+              sprintf(pmsg, "pFlashed %d words...", cnt);
+              webSocket.sendTXT(num, pmsg);
+            }
           }
-          // Config space data already handled in first pass
         }
       }
       if (d_typ==0x04) {
@@ -417,6 +484,7 @@ void PicFlash(String uploadFilename) {
     Serial.println(tmps);
 
     ExitProgMode();
+    return true;
 }
 
 
@@ -424,8 +492,16 @@ void PicFlash(String uploadFilename) {
 // Cleanly exit programming mode
 //
 void ExitProgMode() {
-    VPP_OFF();       // Remove VPP
-    RESET_LOW();     // Transistor OFF, release MCLR
+    if (!manualVPP) {
+      VPP_OFF();       // Remove VPP (auto-VPP circuit)
+    }
+    RESET_HIGH();      // NPN1 ON: pull MCLR to GND (exit programming)
+    delay(1);
+    RESET_LOW();       // NPN1 OFF: release MCLR
+    if (manualVPP) {
+      Serial.println("Manual VPP: Remove 8-9V from MCLR now!");
+    }
+    manualVPP = false;  // Reset for next operation
     DAT_INPUT;
     CLK_INPUT;
     delay(10);       // Let PIC reset and start running

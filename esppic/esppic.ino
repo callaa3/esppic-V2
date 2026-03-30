@@ -20,6 +20,8 @@
 #include <WebSocketsServer.h>
 #include <SPIFFS.h>
 
+#include "pic_defs.h"
+
 #define SWAP16(x) (((x & 0x00ff) << 8) | ((x & 0xff00) >> 8))
 
 #include "index_html.h"
@@ -33,6 +35,11 @@ String uploadFilename;
 File fsUploadFile;
 char resetflag=0;
 uint8_t wsNum;
+
+// Forward declarations for symbols defined in prg_pic.ino
+extern bool manualVPP;
+void PrepManualHVP();
+bool PicFlash(String uploadFilename);
 
 //
 //
@@ -106,7 +113,12 @@ void handleFileUpload() {
     Serial.println("Success");
     webSocket.sendTXT(wsNum, "pFile uploaded" );
     delay(250);
-    PicFlash(uploadFilename);
+    if (!manualVPP) {
+      PicFlash(uploadFilename);
+    } else {
+      Serial.println("Manual VPP mode: skipping auto-flash after upload. Use /flash to program.");
+      webSocket.sendTXT(wsNum, "pManual VPP: upload done, use /flash when VPP applied");
+    }
   }
 }
 
@@ -247,11 +259,91 @@ void setup() {
 
   server.on("/flash", HTTP_GET, []() {
     Serial.println("HTTP_GET /flash");
-    PicFlash(uploadFilename);
-    char *html=(char *)malloc(10000);
-    strcpy(html,"<h1>FLASH DONE</h1><a href=\"/\">Back</a>");
-    server.send(200, "text/html", html);
-    free(html);
+    bool ok = PicFlash(uploadFilename);
+    if (ok) {
+      server.send(200, "text/html", "<h1>FLASH DONE</h1><a href=\"/\">Back</a>");
+    } else {
+      server.send(200, "text/html", "<h1>FLASH FAILED</h1><p>PIC not responding. Check wiring and VPP.</p><a href=\"/\">Back</a>");
+    }
+  });
+
+  server.on("/prep_hvp", HTTP_GET, []() {
+    Serial.println("HTTP_GET /prep_hvp");
+    PrepManualHVP();
+    server.send(200, "text/plain", "OK");
+  });
+
+  server.on("/diag", HTTP_GET, []() {
+    Serial.println("HTTP_GET /diag");
+    String result = "ESPPIC-V2 Wiring Diagnostics\n\n";
+    char buf[100];
+
+    // Test MCLR control (NPN1 on GPIO 27)
+    result += "1. MCLR transistor (GPIO 27):\n";
+    RESET_OUTPUT;
+    RESET_HIGH();   // NPN1 ON: MCLR pulled to GND
+    delay(50);
+    result += "   GPIO 27 = HIGH (NPN1 ON, MCLR should be at GND)\n";
+
+    // Test VPP control (NPN2 on GPIO 14)
+    result += "\n2. VPP transistor (GPIO 14):\n";
+    VPP_OUTPUT;
+    VPP_ON();       // NPN2 OFF: 8-9V reaches MCLR
+    delay(50);
+    result += "   VPP_ON: GPIO 14 = LOW (NPN2 OFF, 8-9V should reach MCLR)\n";
+
+    // Now release MCLR and try to read DEVID
+    RESET_LOW();    // NPN1 OFF: release MCLR so VPP reaches pin
+    delay(50);
+    result += "\n3. Attempting HVP entry (MCLR released, VPP ON)...\n";
+
+    // Set data/clock low
+    DAT_OUTPUT;
+    CLK_OUTPUT;
+    DAT_LOW;
+    CLK_LOW;
+    digitalWrite(PIN_CLK, LOW);
+    delayMicroseconds(500);
+
+    // Try reading DEVID
+    CmdResetAddress();
+    CmdLoadConfig(0x00);
+    uint16_t data[16];
+    CmdReadData(data, 16);
+
+    char buf[80];
+    sprintf(buf, "   DEVID  = 0x%04X  (expect 0x1480 for PIC16LF1847)\n", data[DEVID]);
+    result += buf;
+    sprintf(buf, "   DEVREV = 0x%04X\n", data[DEVREV]);
+    result += buf;
+    sprintf(buf, "   CONFIG1= 0x%04X\n", data[CONFIG1]);
+    result += buf;
+    sprintf(buf, "   CONFIG2= 0x%04X\n", data[CONFIG2]);
+    result += buf;
+
+    if (data[DEVID] == 0x3FFF) {
+      result += "\n   RESULT: FAIL - PIC not responding.\n";
+      result += "   Check:\n";
+      result += "   - NPN1 collector is connected to MCLR/VPP (Pin 4)\n";
+      result += "   - NPN1 emitter is connected to GND\n";
+      result += "   - NPN1 base has 1K resistor to GPIO 27\n";
+      result += "   - 8-9V is connected to MCLR/VPP (or NPN2 circuit)\n";
+      result += "   - ICSPDAT (GPIO 25) goes to Pin 13 (RB7/PGD)\n";
+      result += "   - ICSPCLK (GPIO 26) goes to Pin 12 (RB6/PGC)\n";
+      result += "   - GND is shared between ESP32, BMS, and 8-9V supply\n";
+      result += "   - Battery is awake (press trigger for V6)\n";
+    } else {
+      result += "\n   RESULT: OK - PIC is responding!\n";
+    }
+
+    // Clean up
+    VPP_OFF();
+    RESET_LOW();
+    DAT_INPUT;
+    CLK_INPUT;
+    delay(10);
+
+    server.send(200, "text/plain", result);
   });
 
   server.onNotFound([](){
